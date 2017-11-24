@@ -1,111 +1,141 @@
 #include <stdio.h>
 #include <string.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <stdbool.h>
 
 #include <libopencm3/cm3/nvic.h>
+#include <libopencm3/cm3/scb.h>
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
-#include <libopencm3/stm32/i2c.h>
 #include <libopencm3/stm32/timer.h>
-#include <libopencm3/stm32/spi.h>
-#include <libopencm3/stm32/exti.h>
+#include <libopencm3/stm32/pwr.h>
+#include <libopencm3/stm32/iwdg.h>
+
+#include "sensor.h"
+#include "can.h"
 
 #define LED_PORT GPIOB
 #define LED_PIN GPIO0
 
-#define I2C_TIMEOUT 100000
+/*
+#define SEMIHOSTING
+*/
+
 
 extern void initialise_monitor_handles(void);
 
 
 static void clock_setup(void) {
-	// rcc_set_hpre(RCC_CFGR_HPRE_DIV16);
+	/* Setup SYSCLK to 4MHz (HSE is running at 16MHz). */
+	rcc_osc_on(RCC_HSE);
+	rcc_wait_for_osc_ready(RCC_HSE);
+	rcc_set_sysclk_source(RCC_HSE);
+	rcc_set_hpre(RCC_CFGR_HPRE_DIV4);
+
 	rcc_periph_clock_enable(RCC_GPIOA);
 	rcc_periph_clock_enable(RCC_GPIOB);
-	rcc_periph_clock_enable(RCC_I2C1);
 }
 
 
 static void gpio_setup(void) {
 	/* Initialize the STAT LED. */
 	gpio_mode_setup(LED_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, LED_PIN);
-
-	/* Initialize the I2C bus. */
-	gpio_mode_setup(GPIOB, GPIO_MODE_AF, GPIO_PUPD_PULLUP, GPIO6 | GPIO7);
-	gpio_set_af(GPIOB, GPIO_AF1, GPIO6 | GPIO7);
 }
 
 
-static void i2c_setup(void) {
-	i2c_reset(I2C1);
-	i2c_peripheral_disable(I2C1);
-	i2c_enable_analog_filter(I2C1);
-	i2c_set_digital_filter(I2C1, I2C_CR1_DNF_DISABLED);
-	i2c_set_speed(I2C1, i2c_speed_sm_100k, 8);
-	i2c_enable_stretching(I2C1);
-	i2c_set_7bit_addr_mode(I2C1);
-	i2c_peripheral_enable(I2C1);
+static void periodic_timer_setup(void) {
+	rcc_periph_clock_enable(RCC_TIM3);
+
+	timer_reset(TIM3);
+	timer_set_mode(TIM3, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
+	timer_continuous_mode(TIM3);
+	timer_direction_up(TIM3);
+	timer_disable_preload(TIM3);
+	timer_enable_update_event(TIM3);
+	/* Tick every millisecond. */
+	timer_set_prescaler(TIM3, 3999);
+	timer_set_period(TIM3, 2000);
+
+	timer_disable_oc_preload(TIM3, TIM_OC1);
+	timer_set_oc_value(TIM3, TIM_OC1, 0);
+	timer_enable_irq(TIM3, TIM_DIER_CC1IE);
+
+	nvic_enable_irq(NVIC_TIM3_IRQ);
+	timer_enable_counter(TIM3);
 }
 
 
-static int32_t si7021_temp(void) {
-	uint8_t rh[2] = {0, 0};
-	i2c_transfer7(I2C1, 0x40, &(uint8_t){0xe5}, 1, rh, 2);
-	uint8_t temp[2] = {0, 0};
-	i2c_transfer7(I2C1, 0x40, &(uint8_t){0xe0}, 1, temp, 2);
+void tim3_isr(void) {
+	if (TIM_SR(TIM3) & TIM_SR_CC1IF) {
+		timer_clear_flag(TIM3, TIM_SR_CC1IF);
 
-	return ((((temp[0] << 8) | temp[1]) * 17572) >> 16) - 4685;
+		/* The blue LED is lit while we iterate over the all sensors
+		 * and measure. */
+		gpio_set(LED_PORT, LED_PIN);
+
+		/* Reset and reconfigure the I2C bus before the measurement. This is
+		 * done to (hopefully) avoid all the I2C random troubles. */
+		sensor_setup();
+		sensor_measure_all();
+		gpio_clear(LED_PORT, LED_PIN);
+	}
 }
 
 
-static int32_t si7021_rh(void) {
-	uint8_t rh[2] = {0, 0};
-	i2c_transfer7(I2C1, 0x40, &(uint8_t){0xe5}, 1, rh, 2);
-	uint8_t temp[2] = {0, 0};
-	i2c_transfer7(I2C1, 0x40, &(uint8_t){0xe0}, 1, temp, 2);
-
-	return ((((rh[0] << 8) | rh[1]) * 12500) >> 16) - 600;
+static void delay(uint32_t l) {
+	for (uint32_t i = 0; i < l; i++) {
+		__asm__("nop");
+	}
 }
-
-
-static int32_t mpl3115_pressure(void) {
-	uint8_t pres[3];
-	uint8_t coeff[8];
-	uint8_t status;
-	i2c_transfer7(I2C1, 0x60, &(uint8_t){0x13, 0x07}, 2, NULL, 0);
-	i2c_transfer7(I2C1, 0x60, &(uint8_t){0x26, 0x35}, 2, NULL, 0);
-	i2c_transfer7(I2C1, 0x60, &(uint8_t){0x01}, 1, pres, 3);
-	return ((pres[0] << 16) | (pres[1] << 8) | (pres[2])) >> 4;
-}
-
-static int32_t mpl3115_temp(void) {
-	int8_t temp_int;
-	uint8_t temp_frac;
-	i2c_transfer7(I2C1, 0x60, &(uint8_t){0x04}, 1, &temp_int, 1);
-	i2c_transfer7(I2C1, 0x60, &(uint8_t){0x05}, 1, &temp_frac, 1);
-
-	/* muh */
-	int16_t temp = ((temp_int << 8) | temp_frac) >> 4;
-	return temp * 1000 / 16;
-
-}
-
 
 
 int main(void) {
 
 	clock_setup();
-	initialise_monitor_handles();
+	#if defined(SEMIHOSTING)
+		initialise_monitor_handles();
+	#endif
 	gpio_setup();
-	i2c_setup();
+	sensor_setup();
+	can_setup();
+
+	/* Wait a bit before trying to detect sensors. */
+	delay(1000000);
+
+	/* But allow only few seconds to detect them. */
+	iwdg_set_period_ms(10000);
+	iwdg_start();
+
+	sensor_detect_all_buses();
+	if (sensor_count == 0) {
+		/* If no sensors were detected, do a single long LED blink. */
+		gpio_set(LED_PORT, LED_PIN);
+		delay(1000000);
+		gpio_clear(LED_PORT, LED_PIN);
+	} else {
+		/* If there was at least one sensor detected, blink shortly for
+		 * every sensor. */
+		for (size_t i = 0; i < sensor_count; i++) {
+			gpio_set(LED_PORT, LED_PIN);
+			delay(30000);
+			gpio_clear(LED_PORT, LED_PIN);
+			delay(50000);
+		}
+	}
+	delay(1000000);
+	periodic_timer_setup();
 
 	while (1) {
-		gpio_toggle(LED_PORT, LED_PIN);
-		for (uint32_t i = 0; i < 100000; i++) {
-			__asm__("nop");
-		}
-		printf("temp=%d rh=%d pres=%d temp2=%d\n", si7021_temp(), si7021_rh(), mpl3115_pressure(), mpl3115_temp());
+		/* This piece of code runs every time the MCU is woken. Reset the watchdog here.
+		 * If we are being stuck in the interrupt handler (sensor reading) or anything goes
+		 * wrong, the watchdog resets the MCU. */
+		iwdg_reset();
+		/* Enter the low power stop mode. */
+		// PWR_CR |= PWR_CR_LPSDSR;
+		PWR_CR &= ~PWR_CR_PDDS;
+		// PWR_CR &= ~PWR_CR_LPDS;
+		// SCB_SCR |= SCB_SCR_SLEEPDEEP;
+		__asm volatile ("wfi");
 	}
 
 	return 0;

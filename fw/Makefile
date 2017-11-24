@@ -1,5 +1,5 @@
 BINARY = main
-# OBJS += uxb_locm3.o
+OBJS += sensor.o si7021.o mpl3115.o can.o
 
 
 LDSCRIPT = stm32f050g6u6.ld
